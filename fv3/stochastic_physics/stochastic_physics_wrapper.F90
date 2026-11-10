@@ -137,9 +137,14 @@ module stochastic_physics_wrapper_mod
     use atmosphere_mod,     only: Atm, mygrid
 
     use stochastic_physics,           only: init_stochastic_physics, run_stochastic_physics
-    use cellular_automata_global_mod, only: cellular_automata_global
+!    use cellular_automata_global_mod, only: cellular_automata_global
     use cellular_automata_sgs_mod,    only: cellular_automata_sgs
     use lndp_apply_perts_mod,         only: lndp_apply_perts
+    !! use new cellular automata 
+    use cellular_automata_mod
+    use spectral_transforms, only: stochy_la2ga
+    use fv_mp_mod, only: mp_reduce_min
+    use kinddef, only: kind_io8
 
     implicit none
 
@@ -154,6 +159,11 @@ module stochastic_physics_wrapper_mod
 
     integer :: nthreads, nb, levs, maxblk, nblks, n, v, ixs, ixe
     logical :: param_update_flag
+
+    !! cellular automata object, save makes sure it persists
+    type(ca_grid_t), save :: CA_grid
+    real(kind=kind_phys) :: grid_size
+    real(kind=kind_io8), allocatable, save :: fv3_ca(:,:,:)
 
 #ifdef _OPENMP
     nthreads = omp_get_max_threads()
@@ -279,7 +289,19 @@ module stochastic_physics_wrapper_mod
           allocate(ca1_cpl (1:nblks, maxblk))
           allocate(ca2_cpl (1:nblks, maxblk))
           allocate(ca3_cpl (1:nblks, maxblk))
+          allocate(fv3_ca(1:nblks, maxblk, GFS_Control%nca_g))
+          fv3_ca = 0.0
         endif
+      endif
+
+      !! cellular automata init or restart -- where in init should this go?
+      if (GFS_Control%do_ca .and. GFS_Control%ca_global .and. GFS_Control%nca_g > 0) then
+        grid_size = minval(GFS_Grid%dx)
+        call mp_reduce_min(grid_size)
+        call initialize_cellular_automata(grid_size,            &
+                                          GFS_Control%ncells_g, &
+                                          GFS_Control%nca_g,    &
+                                          CA_grid)
       endif
 
       is_initialized = .true.
@@ -475,6 +497,16 @@ module stochastic_physics_wrapper_mod
           call transfer_field_to_stochastics_3d(GFS_Control%blksz, GFS_Statein%vgrs, vwind)
           call transfer_field_to_stochastics_3d(GFS_Control%blksz, GFS_Statein%phil, height)
          call transfer_field_to_stochastics(GFS_Control%blksz, GFS_Grid%dx, dx)
+         !! call the update -- currently only global flag available
+         !call update_cellular_automata(
+         !       GFS_Control%kdt,            &
+         !       GFS_Control%iseed_ca,       &
+         !       GFS_Control%nfracseed,      &
+         !       GFS_Control%nseed,          &
+         !       GFS_Control%nspinup,        &
+         !       GFS_Control%nlives,         &
+         !       CA_grid
+         !     )
          call cellular_automata_sgs(GFS_Control%kdt,GFS_control%dtp,GFS_control%restart,GFS_Control%first_time_step,              &
             sst,lmsk,lake,uwind,vwind,height,dx,condition,ca_deep_cpl,ca_turb_cpl,ca_shal_cpl, Atm(mygrid)%domain_for_coupler,nblks,      &
             Atm_block%isc,Atm_block%iec,Atm_block%jsc,Atm_block%jec,Atm(mygrid)%npx,Atm(mygrid)%npy, levs,                        &
@@ -489,11 +521,38 @@ module stochastic_physics_wrapper_mod
          enddo
        endif
        if(GFS_Control%ca_global)then
-          call cellular_automata_global(GFS_Control%kdt,GFS_control%restart,GFS_Control%first_time_step,ca1_cpl,ca2_cpl,ca3_cpl,                &
-            Atm(mygrid)%domain_for_coupler, nblks,Atm_block%isc,Atm_block%iec,Atm_block%jsc,Atm_block%jec,Atm(mygrid)%npx,Atm(mygrid)%npy,levs, &
-            GFS_Control%nca_g,GFS_Control%ncells_g,GFS_Control%nlives_g,GFS_Control%nfracseed,GFS_Control%nseed_g,                              &
-            GFS_Control%iseed_ca,GFS_control%tile_num,GFS_Control%ca_smooth,GFS_Control%nspinup,Atm_block%blksz(1),                             &
-            GFS_Control%nsmooth,GFS_Control%ca_amplitude,GFS_Control%master,GFS_Control%communicator)
+          if (GFS_Control%nca_g > 0) then
+              call update_cellular_automata(GFS_Control%kdt,       &
+                                            GFS_Control%iseed_ca,  &
+                                            GFS_Control%nfracseed, &
+                                            GFS_Control%nseed_g,   &
+                                            GFS_Control%nspinup,   &
+                                            GFS_Control%nlives_g,  &
+                                            GFS_Control%ca_amplitude, &
+                                            CA_grid)
+              call remap_ca_to_fv3(CA_grid, GFS_Grid%xlon, GFS_Grid%xlat, fv3_ca)
+              ca1_cpl = real(fv3_ca(:,:,1), kind_phys)
+              ca2_cpl = 0.0
+              ca3_cpl = 0.0
+              if (GFS_Control%nca_g >= 2) ca2_cpl = real(fv3_ca(:,:,2), kind_phys)
+              if (GFS_Control%nca_g >= 3) ca3_cpl = real(fv3_ca(:,:,3), kind_phys)
+
+              if (GFS_Control%me == GFS_Control%master) then
+                  print *, "CA: Outputting cellular automata"
+                  call write_cellular_automata('ca_restart.nc', CA_grid, GFS_Control%kdt)
+              endif
+              call fv3ca_write(fv3_ca, GFS_Control%kdt, ierr)
+              if (ierr /= 0) then
+                call mpp_error(FATAL, 'Failed to write FV3 CA test output')
+                return
+              endif
+          endif
+
+!          call cellular_automata_global(GFS_Control%kdt,GFS_control%restart,GFS_Control%first_time_step,ca1_cpl,ca2_cpl,ca3_cpl,                &
+!            Atm(mygrid)%domain_for_coupler, nblks,Atm_block%isc,Atm_block%iec,Atm_block%jsc,Atm_block%jec,Atm(mygrid)%npx,Atm(mygrid)%npy,levs, &
+!            GFS_Control%nca_g,GFS_Control%ncells_g,GFS_Control%nlives_g,GFS_Control%nfracseed,GFS_Control%nseed_g,                              &
+!            GFS_Control%iseed_ca,GFS_control%tile_num,GFS_Control%ca_smooth,GFS_Control%nspinup,Atm_block%blksz(1),                             &
+!            GFS_Control%nsmooth,GFS_Control%ca_amplitude,GFS_Control%master,GFS_Control%communicator)
           ! Copy contiguous data back
           do nb=1,nblks
              GFS_Coupling%ca1(GFS_Control%chunk_begin(nb):GFS_Control%chunk_end(nb)) = ca1_cpl(nb,1:GFS_Control%blksz(nb))
@@ -507,6 +566,138 @@ module stochastic_physics_wrapper_mod
     endif initalize_stochastic_physics
 
   contains
+    
+    ! Remaps gaussian grid to fv3 using stochy_la2ga
+    subroutine remap_ca_to_fv3(gaussian_grid, target_lons, target_lats, fv3_fields)
+      type(ca_grid_t), intent(in) :: gaussian_grid
+      real(kind=kind_phys), intent(in) :: target_lons(:), target_lats(:)
+      real(kind=kind_io8), intent(out) :: fv3_fields(:,:,:)
+      real(kind=kind_io8), parameter :: rad2deg = 180.0_kind_io8 / acos(-1.0_kind_io8)
+      integer :: block, field_index, blocksize, first_point, last_point
+
+      fv3_fields = 0.0_kind_io8
+      do field_index=1,gaussian_grid%nca
+        do block=1,nblks
+          blocksize = GFS_Control%blksz(block)
+          first_point = GFS_Control%chunk_begin(block)
+          last_point = GFS_Control%chunk_end(block)
+          call stochy_la2ga(gaussian_grid%field(:,:,field_index), &
+               gaussian_grid%nlon, gaussian_grid%nlat, gaussian_grid%lons, gaussian_grid%lats, &
+               gaussian_grid%wlon, gaussian_grid%rnlat, fv3_fields(block,1:blocksize,field_index), &
+               blocksize, real(target_lats(first_point:last_point), kind_io8) * rad2deg, &
+               real(target_lons(first_point:last_point), kind_io8) * rad2deg)
+        enddo
+      enddo
+    end subroutine remap_ca_to_fv3
+
+    !! CA fv3 output for testing, can be removed!
+    subroutine fv3ca_write(ca, time, ierr)
+      use netcdf
+      real(kind=kind_io8), intent(in) :: ca(:,:,:)
+      integer, intent(in) :: time
+      integer, intent(out) :: ierr
+      character(len=128) :: filename
+      character(len=32) :: var_name
+      integer :: ncid, xdim_id, ydim_id, time_dim_id
+      integer :: xt_var_id, yt_var_id, time_var_id
+      integer :: nx_out, ny_out, nc_out, field_index, record, close_error
+      integer :: block, point, grid_i, grid_j
+      integer :: ca_ids(size(ca,3))
+      real(kind=4) :: grid_xt(Atm_block%iec-Atm_block%isc+1)
+      real(kind=4) :: grid_yt(Atm_block%jec-Atm_block%jsc+1)
+      real(kind=4) :: workg(Atm_block%iec-Atm_block%isc+1, Atm_block%jec-Atm_block%jsc+1)
+      real(kind=4), parameter :: undef = 9.99e+20
+      logical :: file_exists
+
+      nx_out = size(workg,1)
+      ny_out = size(workg,2)
+      nc_out = size(ca,3)
+      grid_xt = [(real(point, kind=4), point=Atm_block%isc,Atm_block%iec)]
+      grid_yt = [(real(point, kind=4), point=Atm_block%jsc,Atm_block%jec)]
+      write(filename, '("RESTART/ca_out.pe", I6.6, ".nc")') GFS_Control%me
+      inquire(file=trim(filename), exist=file_exists)
+
+      if (.not. file_exists) then
+        ierr = nf90_create(trim(filename), NF90_CLOBBER, ncid)
+        if (ierr /= nf90_noerr) return
+        ierr = nf90_def_dim(ncid, 'grid_xt', nx_out, xdim_id)
+        if (ierr /= nf90_noerr) goto 900
+        ierr = nf90_def_dim(ncid, 'grid_yt', ny_out, ydim_id)
+        if (ierr /= nf90_noerr) goto 900
+        ierr = nf90_def_dim(ncid, 'time', NF90_UNLIMITED, time_dim_id)
+        if (ierr /= nf90_noerr) goto 900
+        ierr = nf90_def_var(ncid, 'grid_xt', NF90_FLOAT, (/xdim_id/), xt_var_id)
+        if (ierr /= nf90_noerr) goto 900
+        ierr = nf90_put_att(ncid, xt_var_id, 'cartesian_axis', 'X')
+        if (ierr /= nf90_noerr) goto 900
+        ierr = nf90_def_var(ncid, 'grid_yt', NF90_FLOAT, (/ydim_id/), yt_var_id)
+        if (ierr /= nf90_noerr) goto 900
+        ierr = nf90_put_att(ncid, yt_var_id, 'cartesian_axis', 'Y')
+        if (ierr /= nf90_noerr) goto 900
+        ierr = nf90_def_var(ncid, 'time', NF90_INT, (/time_dim_id/), time_var_id)
+        if (ierr /= nf90_noerr) goto 900
+        ierr = nf90_put_att(ncid, time_var_id, 'units', 'model timesteps')
+        if (ierr /= nf90_noerr) goto 900
+        ierr = nf90_put_att(ncid, time_var_id, 'cartesian_axis', 'T')
+        if (ierr /= nf90_noerr) goto 900
+        ierr = nf90_put_att(ncid, NF90_GLOBAL, 'tile', GFS_Control%tile_num)
+        if (ierr /= nf90_noerr) goto 900
+        do field_index=1,nc_out
+          write(var_name, '("ca", I0)') field_index
+          ierr = nf90_def_var(ncid, trim(var_name), NF90_FLOAT, &
+                             (/xdim_id,ydim_id,time_dim_id/), ca_ids(field_index))
+          if (ierr /= nf90_noerr) goto 900
+          ierr = nf90_put_att(ncid, ca_ids(field_index), 'long_name', 'random pattern' // trim(var_name))
+          if (ierr /= nf90_noerr) goto 900
+          ierr = nf90_put_att(ncid, ca_ids(field_index), 'units', 'None')
+          if (ierr /= nf90_noerr) goto 900
+          ierr = nf90_put_att(ncid, ca_ids(field_index), 'missing_value', undef)
+          if (ierr /= nf90_noerr) goto 900
+          ierr = nf90_put_att(ncid, ca_ids(field_index), '_FillValue', undef)
+          if (ierr /= nf90_noerr) goto 900
+          ierr = nf90_put_att(ncid, ca_ids(field_index), 'cell_methods', 'time: point')
+          if (ierr /= nf90_noerr) goto 900
+        enddo
+        ierr = nf90_enddef(ncid)
+        if (ierr /= nf90_noerr) goto 900
+        ierr = nf90_put_var(ncid, xt_var_id, grid_xt)
+        if (ierr /= nf90_noerr) goto 900
+        ierr = nf90_put_var(ncid, yt_var_id, grid_yt)
+        if (ierr /= nf90_noerr) goto 900
+      else
+        ierr = nf90_open(trim(filename), NF90_WRITE, ncid)
+        if (ierr /= nf90_noerr) return
+        ierr = nf90_inq_dimid(ncid, 'time', time_dim_id)
+        if (ierr /= nf90_noerr) goto 900
+        ierr = nf90_inq_varid(ncid, 'time', time_var_id)
+        if (ierr /= nf90_noerr) goto 900
+        do field_index=1,nc_out
+          write(var_name, '("ca", I0)') field_index
+          ierr = nf90_inq_varid(ncid, trim(var_name), ca_ids(field_index))
+          if (ierr /= nf90_noerr) goto 900
+        enddo
+      endif
+
+      ierr = nf90_inquire_dimension(ncid, time_dim_id, len=record)
+      if (ierr /= nf90_noerr) goto 900
+      record = record + 1
+      ierr = nf90_put_var(ncid, time_var_id, time, start=(/record/))
+      if (ierr /= nf90_noerr) goto 900
+      do field_index=1,nc_out
+        workg = undef
+        do block=1,nblks
+          do point=1,GFS_Control%blksz(block)
+            grid_i = Atm_block%index(block)%ii(point) - Atm_block%isc + 1
+            grid_j = Atm_block%index(block)%jj(point) - Atm_block%jsc + 1
+            workg(grid_i,grid_j) = real(ca(block,point,field_index), kind=4)
+          enddo
+        enddo
+        ierr = nf90_put_var(ncid, ca_ids(field_index), workg, start=(/1,1,record/))
+        if (ierr /= nf90_noerr) goto 900
+      enddo
+900   close_error = nf90_close(ncid)
+      if (ierr == nf90_noerr) ierr = close_error
+    end subroutine fv3ca_write
 
     !> Transfers a 2D field to the stochastics module.
     !>

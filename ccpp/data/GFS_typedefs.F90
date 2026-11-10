@@ -1459,7 +1459,7 @@ module GFS_typedefs
     integer(kind=kind_dbl_prec) :: iseed_ca        !< seed for random number generation in ca scheme
     integer              :: nspinup         !< number of iterations to spin up the ca
     real(kind=kind_phys) :: nthresh         !< threshold used for convection coupling
-    real                 :: ca_amplitude    !< amplitude of ca trigger perturbation
+    real(kind=kind_phys) :: ca_amplitude    !< amplitude of ca trigger perturbation
     integer              :: nsmooth         !< number of passes through smoother
     logical              :: ca_closure      !< logical switch for ca on closure
     logical              :: ca_entr         !< logical switch for ca on entrainment
@@ -4071,7 +4071,7 @@ module GFS_typedefs
     logical              :: ca_global      = .false.
     logical              :: ca_smooth      = .false.
     real(kind=kind_phys) :: nthresh        = 18
-    real                 :: ca_amplitude   = 0.35
+    real(kind=kind_phys) :: ca_amplitude   = 0.35
     integer              :: nsmooth        = 100
     logical              :: ca_closure     = .false.
     logical              :: ca_entr        = .false.

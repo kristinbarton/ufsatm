@@ -717,6 +717,8 @@ subroutine atmos_model_init (Atmos, Time_init, Time, Time_step)
    call fv3atm_restart_read (GFS_sfcprop, GFS_restart_var, Atm_block, GFS_control, Atmos%domain_for_read, &
                              Atm(mygrid)%flagstruct%warm_start, ignore_rst_cksum)
   if(GFS_control%do_ca .and. Atm(mygrid)%flagstruct%warm_start)then
+    !! cellular automata do restart here...?
+    !call restart_cellular_automata(restart_file, time_index, CA_grid)
     call read_ca_restart (Atmos%domain,3,GFS_control%ncells,GFS_control%nca,GFS_control%ncells_g,GFS_control%nca_g)
   endif
    ! Populate the GFS_Statein container with the prognostic state
@@ -1051,6 +1053,8 @@ end subroutine InitTimeFromIAUOffset
 subroutine atmos_model_end (Atmos)
   use get_stochy_pattern_mod, only: write_stoch_restart_atm
   use update_ca, only: write_ca_restart
+  !! cellular automata new restart for GG
+  !use cellular_automata_mod, only: restart_cellular_automata
   type (atmos_data_type), intent(inout) :: Atmos
 !---local variables
   integer :: ierr
@@ -1094,6 +1098,8 @@ end subroutine atmos_model_end
 !> @param[in] timestamp Model timestamp
 subroutine atmos_model_restart(Atmos, timestamp)
   use update_ca, only: write_ca_restart
+  !! cellular automata new restart for GG
+  !use cellular_automata_mod, only: restart_cellular_automata
   type (atmos_data_type),   intent(inout) :: Atmos
   character(len=*),  intent(in)           :: timestamp
 
@@ -1108,6 +1114,8 @@ subroutine atmos_model_restart(Atmos, timestamp)
     endif
     if(GFS_control%do_ca)then
        call write_ca_restart(timestamp)
+       !! cellular automata: generate restart file
+       ! call write_cellular_automata(timestamp)
     endif
 end subroutine atmos_model_restart
 !> @brief Retrieve ungridded dimensions of atmospheric model arrays
